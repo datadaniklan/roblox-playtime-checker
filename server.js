@@ -3,79 +3,134 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const OPENAI_KEY = process.env.OPENAI_KEY;
-const MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+app.get("/", (req, res) => res.send("OK - Playtime Checker running ✅"));
 
-app.use((req, res, next) => {
-  console.log(`[REQ] ${req.method} ${req.url}`);
-  next();
-});
+async function fetchJson(url, options = {}) {
+  const r = await fetch(url, options);
+  const txt = await r.text();
+  let data = null;
+  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${url}: ${JSON.stringify(data).slice(0, 200)}`);
+  return data;
+}
 
-app.get("/", (req, res) => {
-  res.send("OK - Roblox AI Bridge is running ✅");
-});
+async function usernameToUserId(username) {
+  const data = await fetchJson("https://users.roblox.com/v1/usernames/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ usernames: [username], excludeBannedUsers: true })
+  });
+  return data?.data?.[0]?.id || null;
+}
 
-app.get("/roblox-ai", (req, res) => {
-  res.send("OK - /roblox-ai is ready ✅ (use POST)");
-});
+async function getAllUserBadges(userId, limitPages = 10) {
+  let cursor = "";
+  const all = [];
+  for (let i = 0; i < limitPages; i++) {
+    const url =
+      `https://badges.roblox.com/v1/users/${userId}/badges?limit=100&sortOrder=Asc` +
+      (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+    const data = await fetchJson(url);
+    all.push(...(data?.data || []));
+    cursor = data?.nextPageCursor;
+    if (!cursor) break;
+  }
+  return all;
+}
 
-app.post("/roblox-ai", async (req, res) => {
+async function getBadgesInfo(badgeIds) {
+  const map = new Map();
+  const chunk = 50;
+  for (let i = 0; i < badgeIds.length; i += chunk) {
+    const part = badgeIds.slice(i, i + chunk);
+    const url = `https://badges.roblox.com/v1/badges?badgeIds=${part.join(",")}`;
+    const data = await fetchJson(url);
+    for (const b of (data?.data || [])) {
+      if (b?.id) map.set(String(b.id), b);
+    }
+  }
+  return map;
+}
+
+async function getUniverseNames(universeIds) {
+  const map = new Map();
+  const chunk = 50;
+  for (let i = 0; i < universeIds.length; i += chunk) {
+    const part = universeIds.slice(i, i + chunk);
+    const url = `https://games.roblox.com/v1/games?universeIds=${part.join(",")}`;
+    const data = await fetchJson(url);
+    for (const g of (data?.data || [])) {
+      if (g?.id) map.set(String(g.id), g.name || `Universe ${g.id}`);
+    }
+  }
+  return map;
+}
+
+// ====== Estimator settings ======
+const MINUTES_PER_BADGE = 6; // small so it doesn't lie too hard
+const MAX_BADGES_USED = 300; // cap per game
+
+function estimateHoursFromBadgeCount(badgeCount) {
+  const used = Math.min(badgeCount, MAX_BADGES_USED);
+  const minutes = used * MINUTES_PER_BADGE;
+  return Math.round((minutes / 60) * 10) / 10; // 1 decimal
+}
+
+app.post("/playtime-estimate", async (req, res) => {
   try {
-    if (!OPENAI_KEY) {
-      return res.status(500).json({ reply: "Server missing OPENAI_KEY 😭" });
+    const username = String(req.body?.username || "").trim();
+    if (!username) return res.json({ ok: false, error: "Missing username" });
+
+    const userId = await usernameToUserId(username);
+    if (!userId) return res.json({ ok: false, error: "User not found" });
+
+    const awards = await getAllUserBadges(userId, 12);
+    const badgeIds = [...new Set(awards.map(a => String(a.badgeId)).filter(Boolean))];
+
+    const badgeInfo = await getBadgesInfo(badgeIds);
+
+    const byUniverse = new Map(); // universeId -> badgeCount
+    for (const award of awards) {
+      const bid = String(award.badgeId);
+      const info = badgeInfo.get(bid);
+      const universeId = info?.awardingUniverse?.id;
+      if (!universeId) continue;
+
+      const key = String(universeId);
+      byUniverse.set(key, (byUniverse.get(key) || 0) + 1);
     }
 
-    const { username, message } = req.body || {};
-    if (typeof message !== "string" || message.trim().length === 0) {
-      return res.json({ reply: "Type something first 😅" });
-    }
+    const universeIds = [...byUniverse.keys()];
+    const names = await getUniverseNames(universeIds);
 
-    const safeUser = String(username || "Player").slice(0, 30);
-    const safeMsg = String(message).slice(0, 300);
+    const games = universeIds.map((uni) => {
+      const badges = byUniverse.get(uni) || 0;
+      const hours = estimateHoursFromBadgeCount(badges);
+      return {
+        universeId: Number(uni),
+        name: names.get(uni) || `Universe ${uni}`,
+        badges,
+        estimatedHours: hours,
+        confidence: "low"
+      };
+    }).sort((a, b) => b.estimatedHours - a.estimatedHours);
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          { role: "system", content: "You are a fun, friendly, safe Roblox AI. Keep replies short." },
-          { role: "user", content: `${safeUser}: ${safeMsg}` },
-        ],
-        max_tokens: 120,
-      }),
+    const totalEstimatedHours =
+      Math.round(games.reduce((s, g) => s + g.estimatedHours, 0) * 10) / 10;
+
+    return res.json({
+      ok: true,
+      username,
+      userId,
+      totalEstimatedHours,
+      games: games.slice(0, 20),
+      note: "Estimate based on public badge counts. Roblox does NOT provide real hours played."
     });
-
-    const text = await response.text(); // read raw body first
-    let data;
-    try { data = JSON.parse(text); } catch { data = null; }
-
-    if (!response.ok) {
-      const errMsg =
-        (data && (data.error?.message || data.error)) ||
-        text ||
-        "Unknown OpenAI error";
-      console.log("[OPENAI ERROR]", response.status, errMsg);
-      return res.json({
-        reply: `OpenAI error ${response.status}: ${String(errMsg).slice(0, 180)} 😭`,
-      });
-    }
-
-    const reply = data?.choices?.[0]?.message?.content?.trim();
-    if (!reply) {
-      console.log("[OPENAI] No choices in response:", text);
-      return res.json({ reply: "No reply from OpenAI (empty response) 😭" });
-    }
-
-    return res.json({ reply });
   } catch (e) {
-    console.log("[SERVER ERROR]", e);
-    return res.json({ reply: "Bridge server error 😭" });
+    console.log("[ERROR]", e);
+    return res.json({ ok: false, error: String(e.message || e) });
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Bridge running on port", port));
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log("Playtime Checker running on port", port));
