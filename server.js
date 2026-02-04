@@ -23,7 +23,7 @@ async function usernameToUserId(username) {
   return data?.data?.[0]?.id || null;
 }
 
-async function getAllUserBadges(userId, limitPages = 10) {
+async function getAllUserBadges(userId, limitPages = 12) {
   let cursor = "";
   const all = [];
   for (let i = 0; i < limitPages; i++) {
@@ -66,14 +66,14 @@ async function getUniverseNames(universeIds) {
   return map;
 }
 
-// ====== Estimator settings ======
-const MINUTES_PER_BADGE = 6; // small so it doesn't lie too hard
-const MAX_BADGES_USED = 300; // cap per game
+// ===== estimator knobs =====
+const MINUTES_PER_BADGE = 6;
+const MAX_BADGES_USED = 300;
 
 function estimateHoursFromBadgeCount(badgeCount) {
   const used = Math.min(badgeCount, MAX_BADGES_USED);
   const minutes = used * MINUTES_PER_BADGE;
-  return Math.round((minutes / 60) * 10) / 10; // 1 decimal
+  return Math.round((minutes / 60) * 10) / 10;
 }
 
 app.post("/playtime-estimate", async (req, res) => {
@@ -85,11 +85,24 @@ app.post("/playtime-estimate", async (req, res) => {
     if (!userId) return res.json({ ok: false, error: "User not found" });
 
     const awards = await getAllUserBadges(userId, 12);
-    const badgeIds = [...new Set(awards.map(a => String(a.badgeId)).filter(Boolean))];
 
+    if (!awards.length) {
+      return res.json({
+        ok: true,
+        username,
+        userId,
+        totalEstimatedHours: 0,
+        games: [],
+        note:
+          "No public badge awards found for this user. Roblox does NOT provide real hours or a full 'games played' list. This tool can only list games where you earned badges."
+      });
+    }
+
+    const badgeIds = [...new Set(awards.map(a => String(a.badgeId)).filter(Boolean))];
     const badgeInfo = await getBadgesInfo(badgeIds);
 
-    const byUniverse = new Map(); // universeId -> badgeCount
+    // universeId -> badge count
+    const byUniverse = new Map();
     for (const award of awards) {
       const bid = String(award.badgeId);
       const info = badgeInfo.get(bid);
@@ -104,13 +117,12 @@ app.post("/playtime-estimate", async (req, res) => {
     const names = await getUniverseNames(universeIds);
 
     const games = universeIds.map((uni) => {
-      const badges = byUniverse.get(uni) || 0;
-      const hours = estimateHoursFromBadgeCount(badges);
+      const badgeCount = byUniverse.get(uni) || 0;
       return {
         universeId: Number(uni),
         name: names.get(uni) || `Universe ${uni}`,
-        badges,
-        estimatedHours: hours,
+        badges: badgeCount,
+        estimatedHours: estimateHoursFromBadgeCount(badgeCount),
         confidence: "low"
       };
     }).sort((a, b) => b.estimatedHours - a.estimatedHours);
@@ -123,8 +135,9 @@ app.post("/playtime-estimate", async (req, res) => {
       username,
       userId,
       totalEstimatedHours,
-      games: games.slice(0, 20),
-      note: "Estimate based on public badge counts. Roblox does NOT provide real hours played."
+      games: games.slice(0, 50),
+      note:
+        "This lists games based on public badge awards (not real hours). Roblox does NOT provide a full list of games played."
     });
   } catch (e) {
     console.log("[ERROR]", e);
